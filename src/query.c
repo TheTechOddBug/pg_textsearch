@@ -5,9 +5,12 @@
 #include <catalog/namespace.h>
 #include <lib/stringinfo.h>
 #include <libpq/pqformat.h>
+#include <nodes/pg_list.h>
+#include <nodes/value.h>
 #include <tsearch/ts_type.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
+#include <utils/regproc.h>
 #include <utils/rel.h>
 #include <utils/syscache.h>
 #include <varatt.h>
@@ -21,6 +24,8 @@
 #include "query.h"
 #include "state.h"
 #include "vector.h"
+
+/* Local helper functions */
 
 PG_FUNCTION_INFO_V1(tpquery_in);
 PG_FUNCTION_INFO_V1(tpquery_out);
@@ -202,8 +207,8 @@ validate_and_open_index(TpQuery *query, char **index_name_out)
 	}
 
 	/* Get the index OID from index name */
-	index_oid =
-			get_relname_relid(index_name, get_namespace_oid("public", false));
+	index_oid = tp_resolve_index_name_shared(index_name);
+
 	if (!OidIsValid(index_oid))
 	{
 		ereport(ERROR,

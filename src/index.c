@@ -12,6 +12,9 @@
 #include <commands/vacuum.h>
 #include <math.h>
 #include <nodes/execnodes.h>
+#include <nodes/pg_list.h>
+#include <nodes/value.h>
+#include <parser/scansup.h>
 #include <storage/bufmgr.h>
 #include <tsearch/ts_type.h>
 #include <utils/backend_progress.h>
@@ -19,6 +22,7 @@
 #include <utils/float.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
+#include <utils/regproc.h>
 #include <utils/rel.h>
 #include <utils/selfuncs.h>
 #include <utils/snapmgr.h>
@@ -34,11 +38,269 @@
 #include "query.h"
 #include "vector.h"
 
-static bool tp_search_posting_lists(
-		IndexScanDesc	   scan,
-		TpLocalIndexState *index_state,
-		TpVector		  *query_vector,
-		TpIndexMetaPage	   metap);
+/* Local helper functions */
+static char *tp_get_qualified_index_name(Relation indexRelation);
+static bool	 tp_search_posting_lists(
+		 IndexScanDesc		scan,
+		 TpLocalIndexState *index_state,
+		 TpVector		   *query_vector,
+		 TpIndexMetaPage	metap);
+static void tp_rescan_cleanup_results(TpScanOpaque so);
+static void tp_rescan_validate_query_index(
+		const char *query_index_name, Relation indexRelation);
+static void tp_rescan_process_orderby(
+		IndexScanDesc	scan,
+		ScanKey			orderbys,
+		int				norderbys,
+		TpIndexMetaPage metap);
+
+/*
+ * Get the appropriate index name for the given index relation.
+ * Returns a qualified name (schema.index) if the index is not visible
+ * in the search path, otherwise returns just the index name.
+ */
+static char *
+tp_get_qualified_index_name(Relation indexRelation)
+{
+	Oid index_namespace = RelationGetNamespace(indexRelation);
+
+	/*
+	 * If the index is not visible in the search path, use a qualified name
+	 */
+	if (!RelationIsVisible(RelationGetRelid(indexRelation)))
+	{
+		char *namespace_name = get_namespace_name(index_namespace);
+		char *relation_name	 = RelationGetRelationName(indexRelation);
+		return psprintf("%s.%s", namespace_name, relation_name);
+	}
+	else
+	{
+		return RelationGetRelationName(indexRelation);
+	}
+}
+
+/*
+ * Clean up any previous scan results in the scan opaque structure
+ */
+static void
+tp_rescan_cleanup_results(TpScanOpaque so)
+{
+	if (!so)
+		return;
+
+	/* Clean up result CTIDs */
+	if (so->result_ctids)
+	{
+		if (so->scan_context)
+		{
+			MemoryContext oldcontext = MemoryContextSwitchTo(so->scan_context);
+			pfree(so->result_ctids);
+			so->result_ctids = NULL;
+			MemoryContextSwitchTo(oldcontext);
+		}
+		else
+		{
+			elog(WARNING,
+				 "No scan context available for cleanup - memory leak!");
+			so->result_ctids = NULL;
+		}
+	}
+
+	/* Clean up result scores */
+	if (so->result_scores)
+	{
+		if (so->scan_context)
+		{
+			MemoryContext oldcontext = MemoryContextSwitchTo(so->scan_context);
+			pfree(so->result_scores);
+			so->result_scores = NULL;
+			MemoryContextSwitchTo(oldcontext);
+		}
+		else
+		{
+			elog(WARNING,
+				 "No scan context available for cleanup - memory leak!");
+			so->result_scores = NULL;
+		}
+	}
+}
+
+/*
+ * Validate that the query index name matches the scan index
+ */
+static void
+tp_rescan_validate_query_index(
+		const char *query_index_name, Relation indexRelation)
+{
+	const char *current_index_name = RelationGetRelationName(indexRelation);
+	bool		name_matches	   = false;
+
+	/* First try exact match (for unqualified names) */
+	if (strcmp(query_index_name, current_index_name) == 0)
+	{
+		name_matches = true;
+	}
+	else if (strchr(query_index_name, '.') != NULL)
+	{
+		/*
+		 * Query specifies schema-qualified name. Extract the
+		 * relation name part and compare that.
+		 */
+		char *dot = strrchr(query_index_name, '.');
+		if (dot != NULL && strcmp(dot + 1, current_index_name) == 0)
+		{
+			/* Also verify the schema matches */
+			char *schema_name =
+					pnstrdup(query_index_name, dot - query_index_name);
+			Oid namespace_oid = get_namespace_oid(schema_name, true);
+
+			if (OidIsValid(namespace_oid) &&
+				namespace_oid == RelationGetNamespace(indexRelation))
+			{
+				name_matches = true;
+			}
+			pfree(schema_name);
+		}
+	}
+
+	if (!name_matches)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tpquery index name mismatch"),
+				 errhint("Query specifies index "
+						 "\"%s\" but scan is on index "
+						 "\"%s\"",
+						 query_index_name,
+						 current_index_name)));
+	}
+}
+
+/*
+ * Process ORDER BY scan keys for <@> operator
+ */
+static void
+tp_rescan_process_orderby(
+		IndexScanDesc	scan,
+		ScanKey			orderbys,
+		int				norderbys,
+		TpIndexMetaPage metap)
+{
+	TpScanOpaque so = (TpScanOpaque)scan->opaque;
+
+	for (int i = 0; i < norderbys; i++)
+	{
+		ScanKey orderby = &orderbys[i];
+
+		/* Check for <@> operator strategy */
+		if (orderby->sk_strategy == 1) /* Strategy 1: <@> operator */
+		{
+			Datum	 query_datum = orderby->sk_argument;
+			TpQuery *query		 = (TpQuery *)DatumGetPointer(query_datum);
+			char	*index_name;
+			char	*query_cstr;
+
+			/* Validate it's a proper tpquery by checking varlena header */
+			if (VARATT_IS_EXTENDED(query) ||
+				VARSIZE_ANY(query) < VARHDRSZ + sizeof(int32) + sizeof(int32))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid tpquery data")));
+			}
+
+			/* Validate index name if provided in query */
+			index_name = get_tpquery_index_name(query);
+			if (index_name)
+			{
+				tp_rescan_validate_query_index(
+						index_name, scan->indexRelation);
+			}
+
+			/* Extract and store query text */
+			query_cstr = pstrdup(get_tpquery_text(query));
+
+			/* Clear query vector since we're using text directly */
+			if (so->query_vector)
+			{
+				pfree(so->query_vector);
+				so->query_vector = NULL;
+			}
+
+			/* Free old query text if it exists */
+			if (so->query_text)
+			{
+				MemoryContext oldcontext = MemoryContextSwitchTo(
+						so->scan_context);
+				pfree(so->query_text);
+				MemoryContextSwitchTo(oldcontext);
+			}
+
+			/* Allocate new query text in scan context */
+			{
+				MemoryContext oldcontext = MemoryContextSwitchTo(
+						so->scan_context);
+				so->query_text = pstrdup(query_cstr);
+				MemoryContextSwitchTo(oldcontext);
+			}
+
+			/* Mark all docs as candidates for ORDER BY operation */
+			if (metap && metap->total_docs > 0)
+				so->result_count = metap->total_docs;
+
+			pfree(query_cstr);
+		}
+	}
+}
+
+/*
+ * Resolve index name to OID with schema support.
+ * Returns the OID of the index, or InvalidOid if not found.
+ * Handles both schema-qualified names (schema.index) and unqualified names.
+ */
+Oid
+tp_resolve_index_name_shared(const char *index_name)
+{
+	Oid index_oid;
+
+	if (strchr(index_name, '.') != NULL)
+	{
+		/* Contains a dot - try to parse as schema.relation */
+		List *namelist = stringToQualifiedNameList(index_name, NULL);
+		if (list_length(namelist) == 2)
+		{
+			char *schemaname = strVal(linitial(namelist));
+			char *relname	 = strVal(lsecond(namelist));
+
+			/* Validate that schema name is not empty */
+			if (schemaname == NULL || strlen(schemaname) == 0)
+			{
+				index_oid = InvalidOid;
+			}
+			else
+			{
+				Oid namespace_oid = get_namespace_oid(schemaname, true);
+
+				if (OidIsValid(namespace_oid))
+					index_oid = get_relname_relid(relname, namespace_oid);
+				else
+					index_oid = InvalidOid;
+			}
+		}
+		else
+		{
+			index_oid = InvalidOid;
+		}
+		list_free_deep(namelist);
+	}
+	else
+	{
+		/* No schema specified - use search path */
+		index_oid = RelnameGetRelid(index_name);
+	}
+
+	return index_oid;
+}
 
 /*
  * Tapir Index Access Method Implementation
@@ -948,54 +1210,16 @@ tp_rescan(
 	/* Retrieve query LIMIT, if available */
 	{
 		int query_limit = tp_get_query_limit(scan->indexRelation);
-
-		if (query_limit > 0)
-			so->limit = query_limit;
-		else
-			so->limit = -1; /* No limit */
+		so->limit		= (query_limit > 0) ? query_limit : -1;
 	}
 
 	/* Reset scan state */
 	if (so)
 	{
-		/* Clean up any previous results before rescan */
-		if (so->result_ctids)
-		{
-			if (so->scan_context)
-			{
-				MemoryContext oldcontext = MemoryContextSwitchTo(
-						so->scan_context);
+		/* Clean up any previous results */
+		tp_rescan_cleanup_results(so);
 
-				pfree(so->result_ctids);
-				so->result_ctids = NULL;
-				MemoryContextSwitchTo(oldcontext);
-			}
-			else
-			{
-				elog(WARNING,
-					 "No scan context available for cleanup - memory leak!");
-				so->result_ctids = NULL;
-			}
-		}
-		if (so->result_scores)
-		{
-			if (so->scan_context)
-			{
-				MemoryContext oldcontext = MemoryContextSwitchTo(
-						so->scan_context);
-
-				pfree(so->result_scores);
-				so->result_scores = NULL;
-				MemoryContextSwitchTo(oldcontext);
-			}
-			else
-			{
-				elog(WARNING,
-					 "No scan context available for cleanup - memory leak!");
-				so->result_scores = NULL;
-			}
-		}
-
+		/* Reset scan position and state */
 		so->current_pos	 = 0;
 		so->result_count = 0;
 		so->eof_reached	 = false;
@@ -1009,88 +1233,7 @@ tp_rescan(
 		if (!metap)
 			metap = tp_get_metapage(scan->indexRelation);
 
-		for (int i = 0; i < norderbys; i++)
-		{
-			ScanKey orderby = &orderbys[i];
-
-			/* Check for <@> operator strategy */
-			if (orderby->sk_strategy == 1) /* Strategy 1: <@> operator */
-			{
-				Datum query_datum = orderby->sk_argument;
-				char *query_cstr;
-
-				/*
-				 * Handle tpquery type - text <@> tpquery operation
-				 * PostgreSQL's type system guarantees this is a tpquery
-				 */
-				TpQuery *query = (TpQuery *)DatumGetPointer(query_datum);
-				char	*index_name;
-				char	*current_index_name;
-
-				/* Validate it's a proper tpquery by checking varlena header */
-				if (VARATT_IS_EXTENDED(query) ||
-					VARSIZE_ANY(query) <
-							VARHDRSZ + sizeof(int32) + sizeof(int32))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("invalid tpquery data")));
-
-				index_name		   = get_tpquery_index_name(query);
-				current_index_name = RelationGetRelationName(
-						scan->indexRelation);
-
-				/* Validate index name if provided in query */
-				if (index_name)
-				{
-					if (strcmp(index_name, current_index_name) != 0)
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-								 errmsg("tpquery index name mismatch"),
-								 errhint("Query specifies index "
-										 "\"%s\" but scan is on index "
-										 "\"%s\"",
-										 index_name,
-										 current_index_name)));
-				}
-
-				query_cstr = pstrdup(get_tpquery_text(query));
-
-				/* Clear query vector since we're using text directly */
-				if (so->query_vector)
-				{
-					pfree(so->query_vector);
-					so->query_vector = NULL;
-				}
-
-				/* Store query for processing during gettuple */
-				if (so->query_text)
-				{
-					/*
-					 * Free old query text if it was allocated in scan context
-					 */
-					MemoryContext oldcontext = MemoryContextSwitchTo(
-							so->scan_context);
-
-					pfree(so->query_text);
-					MemoryContextSwitchTo(oldcontext);
-				}
-
-				/* Allocate new query text in scan context */
-				{
-					MemoryContext oldcontext = MemoryContextSwitchTo(
-							so->scan_context);
-
-					so->query_text = pstrdup(query_cstr);
-					MemoryContextSwitchTo(oldcontext);
-				}
-
-				/* Mark all docs as candidates for ORDER BY operation */
-				if (metap && metap->total_docs > 0)
-					so->result_count = metap->total_docs;
-
-				pfree(query_cstr);
-			}
-		}
+		tp_rescan_process_orderby(scan, orderbys, norderbys, metap);
 
 		if (metap)
 			pfree(metap);
@@ -1210,8 +1353,14 @@ tp_execute_scoring_query(IndexScanDesc scan)
 
 		if (!query_vector && so->query_text)
 		{
-			/* We have a text query - convert it to a vector using the index */
-			char *index_name = RelationGetRelationName(scan->indexRelation);
+			/*
+			 * We have a text query - convert it to a vector using the index.
+			 * We need to use a qualified name if the index is not in the
+			 * search path.
+			 */
+			char *index_name = tp_get_qualified_index_name(
+					scan->indexRelation);
+
 			text *index_name_text  = cstring_to_text(index_name);
 			text *query_text_datum = cstring_to_text(so->query_text);
 

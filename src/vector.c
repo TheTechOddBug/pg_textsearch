@@ -5,10 +5,13 @@
 #include <lib/stringinfo.h>
 #include <libpq/pqformat.h>
 #include <math.h>
+#include <nodes/pg_list.h>
+#include <nodes/value.h>
 #include <stdlib.h>
 #include <tsearch/ts_type.h>
 #include <utils/builtins.h>
 #include <utils/lsyscache.h>
+#include <utils/regproc.h>
 #include <utils/rel.h>
 #include <utils/syscache.h>
 #include <varatt.h>
@@ -19,6 +22,8 @@
 #include "metapage.h"
 #include "posting.h"
 #include "vector.h"
+
+/* Local helper functions */
 
 /* Helper structure for sorting lexemes */
 typedef struct
@@ -570,36 +575,18 @@ to_tpvector(PG_FUNCTION_ARGS)
 	int32		   *frequencies;
 	int				entry_count;
 	TpVector	   *result;
-	List		   *search_path;
-	ListCell	   *lc;
 
 	/* Extract index name */
 	index_name = text_to_cstring(index_name_text);
 
-	/* Look up index OID using direct catalog access */
-	/* Try current search path */
-	search_path = fetch_search_path(false);
-
-	foreach (lc, search_path)
-	{
-		Oid namespace_oid = lfirst_oid(lc);
-
-		index_oid = GetSysCacheOid2(
-				RELNAMENSP,
-				Anum_pg_class_oid,
-				PointerGetDatum(index_name),
-				ObjectIdGetDatum(namespace_oid));
-		if (OidIsValid(index_oid))
-			break;
-	}
-
-	list_free(search_path);
+	/* Look up index OID */
+	index_oid = tp_resolve_index_name_shared(index_name);
 
 	if (!OidIsValid(index_oid))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 errmsg("index \"%s\" does not exist", index_name)));
+				 errmsg("index \"%s\" not found", index_name)));
 	}
 
 	/* Open the index relation to get metadata */

@@ -5,11 +5,14 @@
 #include <access/reloptions.h>
 #include <access/relscan.h>
 #include <access/sdir.h>
+#include <access/sysattr.h>
+#include <access/table.h>
 #include <access/tableam.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_opclass.h>
 #include <commands/progress.h>
 #include <commands/vacuum.h>
+#include <executor/spi.h>
 #include <math.h>
 #include <nodes/execnodes.h>
 #include <nodes/pg_list.h>
@@ -20,6 +23,7 @@
 #include <utils/backend_progress.h>
 #include <utils/builtins.h>
 #include <utils/float.h>
+#include <utils/fmgroids.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <utils/regproc.h>
@@ -53,6 +57,7 @@ static void tp_rescan_process_orderby(
 		ScanKey			orderbys,
 		int				norderbys,
 		TpIndexMetaPage metap);
+static bool tp_has_child_tables(Relation heap);
 
 /*
  * Get the appropriate index name for the given index relation.
@@ -300,6 +305,80 @@ tp_resolve_index_name_shared(const char *index_name)
 	}
 
 	return index_oid;
+}
+
+/*
+ * Check if a relation has child tables (uses table inheritance)
+ *
+ * This checks both:
+ * 1. Regular PostgreSQL table inheritance (pg_inherits)
+ * 2. Partitioned tables (relkind = 'p')
+ *
+ * BM25 indexes don't work correctly with inheritance because they only
+ * index rows directly in the table, not rows inherited from child tables.
+ */
+static bool
+tp_has_child_tables(Relation heap)
+{
+	bool		  has_children = false;
+	Oid			  heap_oid	   = RelationGetRelid(heap);
+	int			  spi_result;
+	SPIPlanPtr	  plan = NULL;
+	Datum		  values[1];
+	char		 *nulls			= " "; /* No nulls */
+	volatile bool spi_connected = false;
+
+	/* First check if it's a partitioned table (quick check) */
+	if (heap->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return true;
+
+	/* Check for table inheritance using pg_inherits */
+	PG_TRY();
+	{
+		spi_result	  = SPI_connect();
+		spi_connected = (spi_result == SPI_OK_CONNECT);
+
+		if (!spi_connected)
+			elog(ERROR, "SPI_connect failed");
+
+		/* Query to check if this table has any children */
+		const char *query = "SELECT 1 FROM pg_catalog.pg_inherits "
+							"WHERE inhparent = $1 LIMIT 1";
+
+		/* Prepare the plan */
+		Oid argtypes[1] = {OIDOID};
+		plan			= SPI_prepare(query, 1, argtypes);
+
+		if (plan == NULL)
+			elog(ERROR, "SPI_prepare failed");
+
+		values[0] = ObjectIdGetDatum(heap_oid);
+
+		/* Execute the query */
+		spi_result = SPI_execute_plan(plan, values, nulls, true, 1);
+
+		if (spi_result == SPI_OK_SELECT && SPI_processed > 0)
+			has_children = true;
+
+		/* Clean up SPI */
+		if (plan)
+			SPI_freeplan(plan);
+		SPI_finish();
+		spi_connected = false;
+	}
+	PG_CATCH();
+	{
+		/* Make sure to finish SPI connection if it was established */
+		if (spi_connected)
+		{
+			SPI_finish();
+		}
+		/* Re-throw the error */
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return has_children;
 }
 
 /*
@@ -870,6 +949,17 @@ tp_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		 "BM25 index build started for relation %s",
 		 RelationGetRelationName(index));
 
+	/* Check if the heap uses table inheritance */
+	if (tp_has_child_tables(heap))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("BM25 indexes are not supported on tables with "
+						"inheritance, including TimescaleDB hypertables"),
+				 errhint("BM25 indexes can only be created on regular "
+						 "tables")));
+	}
+
 	/* Report initialization phase */
 	pgstat_progress_update_param(
 			PROGRESS_CREATEIDX_SUBPHASE,
@@ -967,6 +1057,24 @@ tp_buildempty(Relation index)
 	TpIndexMetaPage metap;
 	char		   *text_config_name = NULL;
 	Oid				text_config_oid	 = InvalidOid;
+	Relation		heap;
+
+	/* Get the heap relation to check if it uses inheritance */
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+
+	/* Check if the heap uses table inheritance */
+	if (tp_has_child_tables(heap))
+	{
+		table_close(heap, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("BM25 indexes are not supported on tables with "
+						"inheritance, including TimescaleDB hypertables"),
+				 errhint("BM25 indexes can only be created on regular "
+						 "tables")));
+	}
+
+	table_close(heap, AccessShareLock);
 
 	/* Extract options from index */
 	options = (TpOptions *)index->rd_options;

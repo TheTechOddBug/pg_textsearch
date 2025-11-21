@@ -1,21 +1,22 @@
 EXTENSION = pg_textsearch
-DATA = sql/pg_textsearch--0.0.4.sql \
+DATA = sql/pg_textsearch--0.0.5-dev.sql \
        sql/pg_textsearch--0.0.1--0.0.3.sql \
        sql/pg_textsearch--0.0.2--0.0.3.sql \
-       sql/pg_textsearch--0.0.3--0.0.4.sql
+       sql/pg_textsearch--0.0.3--0.0.4.sql \
+       sql/pg_textsearch--0.0.4--0.0.5-dev.sql
 
 # Source files
 # Full build - debugging initialization crash
 OBJS = \
 	src/mod.o \
-	src/memtable.o \
+	src/memtable/memtable.o \
 	src/memory.o \
 	src/metapage.o \
-	src/posting.o \
+	src/memtable/posting.o \
 	src/index.o \
 	src/vector.o \
 	src/query.o \
-	src/stringtable.o \
+	src/memtable/stringtable.o \
 	src/operator.o \
 	src/limit.o \
 	src/registry.o \

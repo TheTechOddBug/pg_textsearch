@@ -72,6 +72,13 @@ typedef struct TpSharedIndexState
 	/* Note: num_unique_terms is available as memtable->total_terms */
 
 	/*
+	 * Auto-spill tracking: DSA size at last spill to prevent repeated spills.
+	 * DSA memory doesn't shrink when we clear the memtable, so we track the
+	 * size at the last spill and only spill again if DSA has grown.
+	 */
+	Size last_spill_dsa_size;
+
+	/*
 	 * Per-index LWLock for transaction-level serialization.
 	 * Writers acquire this in exclusive mode once per transaction.
 	 * Readers acquire this in shared mode once per transaction.
@@ -97,6 +104,9 @@ typedef struct TpLocalIndexState
 	/* Transaction-level lock tracking */
 	bool	   lock_held; /* True if we hold the lock in this transaction */
 	LWLockMode lock_mode; /* Mode we're holding (LW_SHARED or LW_EXCLUSIVE) */
+
+	/* Bulk load tracking: terms added in current transaction */
+	int64 terms_added_this_xact;
 } TpLocalIndexState;
 
 /* Function declarations for index state management */
@@ -124,3 +134,7 @@ extern void tp_release_all_index_locks(void);
 
 /* Memtable management */
 extern void tp_clear_memtable(TpLocalIndexState *local_state);
+
+/* Bulk load auto-spill */
+extern void tp_bulk_load_spill_check(void);
+extern void tp_reset_bulk_load_counters(void);

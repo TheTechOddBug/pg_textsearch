@@ -27,12 +27,10 @@ SELECT id, content, ROUND((content <@> to_bm25query('hello', 'scoring1_bulk_idx'
 FROM scoring1_bulk
 ORDER BY content <@> to_bm25query('hello', 'scoring1_bulk_idx'), id;
 NOTICE:  BM25 index scan: tid=(0,1), BM25_score=-0.7549
-NOTICE:  BM25 index scan: tid=(0,2), BM25_score=0.0000
- id |       content       |  score  
-----+---------------------+---------
-  1 | hello world         | -0.7549
-  2 | goodbye cruel world |  0.0000
-(2 rows)
+ id |   content   |  score  
+----+-------------+---------
+  1 | hello world | -0.7549
+(1 row)
 
 -- Validate BM25 scoring for 'hello'
 SELECT validate_bm25_scoring('scoring1_bulk', 'content', 'scoring1_bulk_idx', 'hello', 'english', 1.2, 0.75) as hello_valid;
@@ -41,22 +39,36 @@ SELECT validate_bm25_scoring('scoring1_bulk', 'content', 'scoring1_bulk_idx', 'h
  t
 (1 row)
 
+-- Validate index scan vs standalone scoring match for 'hello'
+SELECT validate_index_vs_standalone('scoring1_bulk', 'content', 'scoring1_bulk_idx', 'hello') as hello_modes_match;
+NOTICE:  BM25 index scan: tid=(0,1), BM25_score=-0.7549
+ hello_modes_match 
+-------------------
+ t
+(1 row)
+
 -- Bulk mode query 2: 'cruel'
 SELECT id, content, ROUND((content <@> to_bm25query('cruel', 'scoring1_bulk_idx'))::numeric, 4) as score
 FROM scoring1_bulk
 ORDER BY content <@> to_bm25query('cruel', 'scoring1_bulk_idx'), id;
 NOTICE:  BM25 index scan: tid=(0,2), BM25_score=-0.6407
-NOTICE:  BM25 index scan: tid=(0,1), BM25_score=0.0000
  id |       content       |  score  
 ----+---------------------+---------
   2 | goodbye cruel world | -0.6407
-  1 | hello world         |  0.0000
-(2 rows)
+(1 row)
 
 -- Validate BM25 scoring for 'cruel'
 SELECT validate_bm25_scoring('scoring1_bulk', 'content', 'scoring1_bulk_idx', 'cruel', 'english', 1.2, 0.75) as cruel_valid;
  cruel_valid 
 -------------
+ t
+(1 row)
+
+-- Validate index scan vs standalone scoring match for 'cruel'
+SELECT validate_index_vs_standalone('scoring1_bulk', 'content', 'scoring1_bulk_idx', 'cruel') as cruel_modes_match;
+NOTICE:  BM25 index scan: tid=(0,2), BM25_score=-0.6407
+ cruel_modes_match 
+-------------------
  t
 (1 row)
 
@@ -80,12 +92,10 @@ SELECT id, content, ROUND((content <@> to_bm25query('hello', 'scoring1_incr_idx'
 FROM scoring1_incr
 ORDER BY content <@> to_bm25query('hello', 'scoring1_incr_idx'), id;
 NOTICE:  BM25 index scan: tid=(0,1), BM25_score=-0.7549
-NOTICE:  BM25 index scan: tid=(0,2), BM25_score=0.0000
- id |       content       |  score  
-----+---------------------+---------
-  1 | hello world         | -0.7549
-  2 | goodbye cruel world |  0.0000
-(2 rows)
+ id |   content   |  score  
+----+-------------+---------
+  1 | hello world | -0.7549
+(1 row)
 
 -- Validate BM25 scoring for 'hello' (incremental)
 SELECT validate_bm25_scoring('scoring1_incr', 'content', 'scoring1_incr_idx', 'hello', 'english', 1.2, 0.75) as hello_incr_valid;
@@ -94,22 +104,36 @@ SELECT validate_bm25_scoring('scoring1_incr', 'content', 'scoring1_incr_idx', 'h
  t
 (1 row)
 
+-- Validate index scan vs standalone scoring match for 'hello' (incremental)
+SELECT validate_index_vs_standalone('scoring1_incr', 'content', 'scoring1_incr_idx', 'hello') as hello_incr_modes_match;
+NOTICE:  BM25 index scan: tid=(0,1), BM25_score=-0.7549
+ hello_incr_modes_match 
+------------------------
+ t
+(1 row)
+
 -- Incremental mode query 2: 'cruel'
 SELECT id, content, ROUND((content <@> to_bm25query('cruel', 'scoring1_incr_idx'))::numeric, 4) as score
 FROM scoring1_incr
 ORDER BY content <@> to_bm25query('cruel', 'scoring1_incr_idx'), id;
 NOTICE:  BM25 index scan: tid=(0,2), BM25_score=-0.6407
-NOTICE:  BM25 index scan: tid=(0,1), BM25_score=0.0000
  id |       content       |  score  
 ----+---------------------+---------
   2 | goodbye cruel world | -0.6407
-  1 | hello world         |  0.0000
-(2 rows)
+(1 row)
 
 -- Validate BM25 scoring for 'cruel' (incremental)
 SELECT validate_bm25_scoring('scoring1_incr', 'content', 'scoring1_incr_idx', 'cruel', 'english', 1.2, 0.75) as cruel_incr_valid;
  cruel_incr_valid 
 ------------------
+ t
+(1 row)
+
+-- Validate index scan vs standalone scoring match for 'cruel' (incremental)
+SELECT validate_index_vs_standalone('scoring1_incr', 'content', 'scoring1_incr_idx', 'cruel') as cruel_incr_modes_match;
+NOTICE:  BM25 index scan: tid=(0,2), BM25_score=-0.6407
+ cruel_incr_modes_match 
+------------------------
  t
 (1 row)
 

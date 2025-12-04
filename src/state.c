@@ -35,6 +35,7 @@
 #include "metapage.h"
 #include "registry.h"
 #include "segment/segment.h"
+#include "segment/segment_merge.h"
 #include "state.h"
 
 /* External GUCs from mod.c */
@@ -547,7 +548,8 @@ tp_rebuild_index_from_disk(Oid index_oid)
 
 	/* Check if there's actually anything to recover */
 	if (metap->total_docs == 0 &&
-		metap->first_docid_page == InvalidBlockNumber)
+		metap->first_docid_page == InvalidBlockNumber &&
+		metap->level_heads[0] == InvalidBlockNumber)
 	{
 		/* Empty index - nothing to recover */
 		index_close(index_rel, AccessShareLock);
@@ -1036,13 +1038,13 @@ tp_bulk_load_spill_check(void)
 		{
 			tp_clear_memtable(local_state);
 
-			/* Link new segment as chain head */
+			/* Link new segment as L0 chain head */
 			metabuf = ReadBuffer(index_rel, 0);
 			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
 			metapage = BufferGetPage(metabuf);
 			metap	 = (TpIndexMetaPage)PageGetContents(metapage);
 
-			if (metap->first_segment != InvalidBlockNumber)
+			if (metap->level_heads[0] != InvalidBlockNumber)
 			{
 				/* Point new segment to old chain head */
 				Buffer			 seg_buf;
@@ -1054,18 +1056,24 @@ tp_bulk_load_spill_check(void)
 				seg_page   = BufferGetPage(seg_buf);
 				seg_header = (TpSegmentHeader *)((char *)seg_page +
 												 SizeOfPageHeaderData);
-				seg_header->next_segment = metap->first_segment;
+				seg_header->next_segment = metap->level_heads[0];
 				MarkBufferDirty(seg_buf);
 				UnlockReleaseBuffer(seg_buf);
 			}
 
-			metap->first_segment = segment_root;
+			metap->level_heads[0] = segment_root;
+			metap->level_counts[0]++;
 			MarkBufferDirty(metabuf);
 			UnlockReleaseBuffer(metabuf);
 
 			elog(DEBUG1,
-				 "Bulk load spilled memtable to segment at block %u",
-				 segment_root);
+				 "Bulk load spilled memtable to segment at block %u "
+				 "(L0 count: %u)",
+				 segment_root,
+				 metap->level_counts[0]);
+
+			/* Check if L0 needs compaction */
+			tp_maybe_compact_level(index_rel, 0);
 		}
 
 		index_close(index_rel, RowExclusiveLock);

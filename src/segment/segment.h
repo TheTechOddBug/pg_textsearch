@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include "../constants.h"
 #include "access/htup_details.h"
 #include "postgres.h"
 #include "storage/bufmgr.h"
@@ -13,13 +14,8 @@
 #include "utils/timestamp.h"
 
 /*
- * Magic number for segment validation
- */
-#define TP_SEGMENT_MAGIC   0x54415049 /* "TAPI" */
-#define TP_SEGMENT_VERSION 1		  /* Segment format version */
-
-/*
- * Page types for segment pages
+ * Page types for segment pages.
+ * Magic and version constants are defined in constants.h.
  */
 typedef enum TpPageType
 {
@@ -29,12 +25,15 @@ typedef enum TpPageType
 } TpPageType;
 
 /*
- * Special area for page index pages (goes in page special area)
+ * Special area for page index pages (goes in page special area).
+ * Contains magic/version for validation.
  */
 typedef struct TpPageIndexSpecial
 {
-	BlockNumber next_page; /* Next page in chain, InvalidBlockNumber if last */
+	uint32		magic;	   /* TP_PAGE_INDEX_MAGIC */
+	uint16		version;   /* TP_PAGE_INDEX_VERSION */
 	uint16		page_type; /* TpPageType enum value */
+	BlockNumber next_page; /* Next page in chain, InvalidBlockNumber if last */
 	uint16		num_entries; /* Number of BlockNumber entries on this page */
 	uint16		flags;		 /* Reserved for future use */
 } TpPageIndexSpecial;

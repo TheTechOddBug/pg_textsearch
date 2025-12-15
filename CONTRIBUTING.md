@@ -81,6 +81,96 @@ Before submitting a pull request:
 If you modify error messages, update the corresponding expected output files
 in `test/expected/`.
 
+## Benchmarks
+
+Automated benchmarks run weekly and can be triggered on-demand. The benchmark
+suite uses public IR datasets to measure indexing and query performance.
+
+### Running Benchmarks On-Demand
+
+Trigger benchmarks manually using the GitHub CLI:
+
+```sh
+# Full MS MARCO benchmark (8.8M passages, ~13 minutes)
+gh workflow run benchmark.yml -f dataset=msmarco -f msmarco_size=full
+
+# Quick test with smaller subset (1M passages, ~4 minutes)
+gh workflow run benchmark.yml -f dataset=msmarco -f msmarco_size=1M
+
+# Run all datasets (MS MARCO + Wikipedia)
+gh workflow run benchmark.yml -f dataset=all
+
+# Wikipedia only (configurable size: 10K, 100K, 1M, full)
+gh workflow run benchmark.yml -f dataset=wikipedia -f wikipedia_size=100K
+```
+
+### Viewing Results
+
+Check benchmark status and results:
+
+```sh
+# List recent benchmark runs
+gh run list --workflow=benchmark.yml
+
+# View a specific run
+gh run view <run-id>
+
+# Download benchmark artifacts (includes JSON metrics)
+gh run download <run-id>
+```
+
+Each run produces:
+- `benchmark_results.txt` - Full output log
+- `benchmark_metrics.json` - Structured metrics for comparison
+- `benchmark_summary.md` - Formatted summary
+
+### Local Benchmarks
+
+Run benchmarks locally using the benchmark runner:
+
+```sh
+cd benchmarks
+
+# Run Cranfield (quick validation, ~1400 docs)
+./runner/run_benchmark.sh cranfield --download --load --query
+
+# Run MS MARCO locally (requires ~4GB disk space for full dataset)
+./runner/run_benchmark.sh msmarco --download --load --query --report
+```
+
+### Benchmark Datasets
+
+| Dataset | Documents | Description |
+|---------|-----------|-------------|
+| Cranfield | 1,400 | Classic IR test collection (quick validation) |
+| MS MARCO | 8.8M | Microsoft passage ranking dataset |
+| Wikipedia | Configurable | Wikipedia article extracts |
+
+### Performance Dashboard
+
+Historical benchmark results are tracked and published to GitHub Pages:
+
+**Dashboard URL**: https://timescale.github.io/pg_textsearch/benchmarks/
+
+The dashboard shows:
+- **Index Build Time** - Time to build the BM25 index
+- **Query Latencies** - Per-query execution times (short, medium, long queries)
+- **Average Throughput** - Mean latency across 20 representative queries
+
+### Regression Alerts
+
+Performance is automatically monitored:
+
+- **PRs**: Cranfield benchmarks run on every PR touching `src/` or `benchmarks/`.
+  Results are posted as PR comments comparing against the baseline.
+- **Weekly**: Full MS MARCO benchmarks run every Sunday, updating the baseline.
+- **Releases**: A benchmark gate runs before each release with a stricter 120%
+  threshold. Releases are blocked if performance regresses significantly.
+
+Alert thresholds:
+- **PRs and weekly**: 150% of baseline (warn but don't fail)
+- **Releases**: 120% of baseline (blocks release)
+
 ### Commit Guidelines
 
 - Write clear, concise commit messages

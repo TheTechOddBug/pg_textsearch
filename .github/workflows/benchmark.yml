@@ -5,9 +5,9 @@ permissions:
   deployments: write
 
 on:
-  # Weekly benchmark (only if there are new commits)
+  # Nightly benchmark
   schedule:
-    - cron: '0 6 * * 0'  # Every Sunday at 6 AM UTC
+    - cron: '0 6 * * *'  # Every day at 6 AM UTC
 
   # Manual trigger
   workflow_dispatch:
@@ -44,35 +44,8 @@ on:
           - 'full'
 
 jobs:
-  # Check for new commits (scheduled runs only)
-  check-commits:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Check for commits in last 7 days
-        id: check
-        run: |
-          COMMITS=$(git log --oneline --since="7 days ago" | wc -l)
-          if [ "$COMMITS" -gt 0 ]; then
-            echo "Found $COMMITS commits in last 7 days"
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          else
-            echo "No commits in last 7 days, skipping benchmark"
-            echo "should_run=false" >> $GITHUB_OUTPUT
-          fi
-
   # Full benchmark suite
   full-benchmark:
-    needs: [check-commits]
-    if: |
-      always() &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'schedule' && needs.check-commits.outputs.should_run == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6 hours max for full Wikipedia
 
@@ -235,9 +208,9 @@ jobs:
         echo "**Dataset:** ${{ steps.datasets.outputs.dataset }}" >> benchmark_summary.md
         echo "" >> benchmark_summary.md
 
-        # Extract structured metrics
+        # Extract structured metrics (pass dataset name)
         chmod +x benchmarks/runner/extract_metrics.sh
-        ./benchmarks/runner/extract_metrics.sh benchmark_results.txt benchmark_metrics.json || true
+        ./benchmarks/runner/extract_metrics.sh benchmark_results.txt benchmark_metrics.json "${{ steps.datasets.outputs.dataset }}" || true
 
         # Add metrics to summary
         echo "## Key Metrics" >> benchmark_summary.md
@@ -297,17 +270,21 @@ jobs:
 
     - name: Format metrics for benchmark tracking
       if: always()
+      id: format_metrics
       run: |
         if [ -f benchmark_metrics.json ]; then
           chmod +x benchmarks/runner/format_for_action.sh
           ./benchmarks/runner/format_for_action.sh benchmark_metrics.json benchmark_action.json
+          # Extract dataset name for benchmark label
+          DATASET=$(jq -r '.dataset // "unknown"' benchmark_metrics.json)
+          echo "dataset=$DATASET" >> $GITHUB_OUTPUT
         fi
 
     - name: Store and publish benchmark results
       if: always() && hashFiles('benchmark_action.json') != ''
       uses: benchmark-action/github-action-benchmark@v1
       with:
-        name: 'MS MARCO Benchmarks'
+        name: '${{ steps.format_metrics.outputs.dataset }} Benchmarks'
         tool: 'customSmallerIsBetter'
         output-file-path: benchmark_action.json
         github-token: ${{ secrets.GITHUB_TOKEN }}

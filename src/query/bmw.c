@@ -476,8 +476,20 @@ typedef struct TpTermState
 	/* Segment-specific state (reset per segment) */
 	bool					 found; /* Term found in current segment */
 	TpSegmentPostingIterator iter;	/* Iterator (contains dict_entry) */
-	float4					*block_max_scores; /* Pre-computed block max */
+	float4 *block_max_scores;		/* Pre-computed block max scores */
+	uint32 *block_last_doc_ids;		/* Cached last_doc_id per block */
 } TpTermState;
+
+/*
+ * Get current doc ID for a term, or UINT32_MAX if exhausted.
+ */
+static inline uint32
+term_current_doc_id(TpTermState *ts)
+{
+	if (!ts->found || ts->iter.finished)
+		return UINT32_MAX;
+	return tp_segment_posting_iterator_current_doc_id(&ts->iter);
+}
 
 /*
  * Score memtable postings for multiple terms.
@@ -610,8 +622,116 @@ advance_term_iterator(TpTermState *ts)
 }
 
 /*
+ * Seek a term iterator to target doc ID using binary search on cached skip
+ * data. Returns true if iterator is still active (positioned at doc >=
+ * target), false if exhausted.
+ *
+ * Uses pre-loaded block_last_doc_ids for O(log blocks) in-memory binary
+ * search, avoiding I/O during the search. Only loads the target block from
+ * disk.
+ */
+static bool
+seek_term_to_doc(TpTermState *ts, uint32 target_doc_id)
+{
+	uint16 block_count;
+	int	   left, right, mid;
+	uint16 target_block;
+
+	if (!ts->found || ts->iter.finished)
+		return false;
+
+	/*
+	 * Check if target is in current block - if so, linear scan is faster
+	 * than the seek overhead.
+	 */
+	if (target_doc_id <= ts->iter.skip_entry.last_doc_id)
+	{
+		/* Target is in current block, linear scan within block */
+		while (ts->iter.current_in_block < ts->iter.skip_entry.doc_count)
+		{
+			uint32 doc_id =
+					ts->iter.block_postings[ts->iter.current_in_block].doc_id;
+			if (doc_id >= target_doc_id)
+				return true;
+			ts->iter.current_in_block++;
+		}
+		/* Exhausted current block, fall through to load next */
+		ts->iter.current_block++;
+		if (ts->iter.current_block >= ts->iter.dict_entry.block_count)
+		{
+			ts->iter.finished = true;
+			return false;
+		}
+		ts->iter.current_in_block = 0;
+		tp_segment_posting_iterator_load_block(&ts->iter);
+		return !ts->iter.finished;
+	}
+
+	/*
+	 * Target is beyond current block - binary search on cached last_doc_ids.
+	 * This is pure in-memory search, no I/O until we load the target block.
+	 */
+	block_count = ts->iter.dict_entry.block_count;
+
+	/* Binary search: find first block where last_doc_id >= target */
+	left  = ts->iter.current_block + 1; /* Start after current block */
+	right = block_count - 1;
+
+	while (left < right)
+	{
+		mid = left + (right - left) / 2;
+
+		if (ts->block_last_doc_ids[mid] < target_doc_id)
+			left = mid + 1;
+		else
+			right = mid;
+	}
+
+	target_block = left;
+
+	/* Check if target is past all blocks */
+	if (target_block >= block_count)
+	{
+		ts->iter.finished = true;
+		return false;
+	}
+
+	/* Load the target block */
+	ts->iter.current_block	  = target_block;
+	ts->iter.current_in_block = 0;
+
+	if (!tp_segment_posting_iterator_load_block(&ts->iter))
+	{
+		ts->iter.finished = true;
+		return false;
+	}
+
+	/* Linear scan within block to find target or first doc >= target */
+	while (ts->iter.current_in_block < ts->iter.skip_entry.doc_count)
+	{
+		uint32 doc_id =
+				ts->iter.block_postings[ts->iter.current_in_block].doc_id;
+		if (doc_id >= target_doc_id)
+			return true;
+		ts->iter.current_in_block++;
+	}
+
+	/* Target not in this block, try next */
+	ts->iter.current_block++;
+	if (ts->iter.current_block >= block_count)
+	{
+		ts->iter.finished = true;
+		return false;
+	}
+	ts->iter.current_in_block = 0;
+	tp_segment_posting_iterator_load_block(&ts->iter);
+	return !ts->iter.finished;
+}
+
+/*
  * Initialize term states for a segment.
  * Returns count of active iterators (terms found in segment).
+ * Terms array is sorted by doc ID after initialization.
  */
 static int
 init_segment_term_states(
@@ -629,28 +749,32 @@ init_segment_term_states(
 	{
 		TpTermState *ts = &terms[term_idx];
 
-		ts->found			 = false;
-		ts->block_max_scores = NULL;
+		ts->found			   = false;
+		ts->block_max_scores   = NULL;
+		ts->block_last_doc_ids = NULL;
 
 		if (!tp_segment_posting_iterator_init(&ts->iter, reader, ts->term))
 			continue;
 
 		ts->found = true;
 
-		/* Pre-compute block max scores for BMW threshold checks */
+		/* Pre-load skip entries for BMW threshold checks and fast seeking */
 		if (ts->iter.dict_entry.block_count > 0)
 		{
 			uint16 block_idx;
-			ts->block_max_scores = palloc(
-					ts->iter.dict_entry.block_count * sizeof(float4));
-			for (block_idx = 0; block_idx < ts->iter.dict_entry.block_count;
-				 block_idx++)
+			uint16 block_count = ts->iter.dict_entry.block_count;
+
+			ts->block_max_scores   = palloc(block_count * sizeof(float4));
+			ts->block_last_doc_ids = palloc(block_count * sizeof(uint32));
+
+			for (block_idx = 0; block_idx < block_count; block_idx++)
 			{
 				TpSkipEntry skip;
 				tp_segment_read_skip_entry(
 						reader, &ts->iter.dict_entry, block_idx, &skip);
 				ts->block_max_scores[block_idx] = tp_compute_block_max_score(
 						&skip, ts->idf, k1, b, avg_doc_len);
+				ts->block_last_doc_ids[block_idx] = skip.last_doc_id;
 			}
 		}
 
@@ -675,6 +799,8 @@ cleanup_segment_term_states(TpTermState *terms, int term_count)
 			tp_segment_posting_iterator_free(&terms[term_idx].iter);
 		if (terms[term_idx].block_max_scores)
 			pfree(terms[term_idx].block_max_scores);
+		if (terms[term_idx].block_last_doc_ids)
+			pfree(terms[term_idx].block_last_doc_ids);
 	}
 }
 
@@ -685,23 +811,16 @@ cleanup_segment_term_states(TpTermState *terms, int term_count)
 static uint32
 find_pivot_doc_id(TpTermState *terms, int term_count)
 {
-	uint32 pivot = UINT32_MAX;
+	uint32 min_doc_id = UINT32_MAX;
 	int	   term_idx;
 
 	for (term_idx = 0; term_idx < term_count; term_idx++)
 	{
-		TpTermState *ts = &terms[term_idx];
-		uint32		 doc_id;
-
-		if (!ts->found || ts->iter.finished)
-			continue;
-
-		doc_id = tp_segment_posting_iterator_current_doc_id(&ts->iter);
-		if (doc_id < pivot)
-			pivot = doc_id;
+		uint32 doc_id = term_current_doc_id(&terms[term_idx]);
+		if (doc_id < min_doc_id)
+			min_doc_id = doc_id;
 	}
-
-	return pivot;
+	return min_doc_id;
 }
 
 /*
@@ -717,15 +836,14 @@ compute_pivot_max_score(
 
 	for (term_idx = 0; term_idx < term_count; term_idx++)
 	{
-		TpTermState *ts = &terms[term_idx];
-		uint32		 doc_id;
+		TpTermState *ts		= &terms[term_idx];
+		uint32		 doc_id = term_current_doc_id(ts);
 
-		if (!ts->found || ts->iter.finished)
+		/* Only include terms that are at or before the pivot */
+		if (doc_id > pivot_doc_id)
 			continue;
 
-		doc_id = tp_segment_posting_iterator_current_doc_id(&ts->iter);
-
-		if (doc_id <= pivot_doc_id && ts->block_max_scores != NULL &&
+		if (ts->block_max_scores != NULL &&
 			ts->iter.current_block < ts->iter.dict_entry.block_count)
 		{
 			max_possible += ts->block_max_scores[ts->iter.current_block] *
@@ -759,43 +877,40 @@ score_pivot_document(
 
 	for (term_idx = 0; term_idx < term_count; term_idx++)
 	{
-		TpTermState *ts = &terms[term_idx];
-		uint32		 doc_id;
+		TpTermState	   *ts = &terms[term_idx];
+		uint32			doc_id;
+		TpBlockPosting *bp;
+		float4			term_score;
 
-		if (!ts->found || ts->iter.finished)
+		doc_id = term_current_doc_id(ts);
+		if (doc_id != pivot_doc_id)
 			continue;
 
-		doc_id = tp_segment_posting_iterator_current_doc_id(&ts->iter);
+		bp		   = &ts->iter.block_postings[ts->iter.current_in_block];
+		term_score = compute_bm25_score(
+							 ts->idf,
+							 bp->frequency,
+							 (int32)decode_fieldnorm(bp->fieldnorm),
+							 k1,
+							 b,
+							 avg_doc_len) *
+					 ts->query_freq;
 
-		if (doc_id == pivot_doc_id)
+		doc_score += term_score;
+
+		if (!have_ctid)
 		{
-			TpBlockPosting *bp =
-					&ts->iter.block_postings[ts->iter.current_in_block];
-			float4 term_score = compute_bm25_score(
-										ts->idf,
-										bp->frequency,
-										(int32)decode_fieldnorm(bp->fieldnorm),
-										k1,
-										b,
-										avg_doc_len) *
-								ts->query_freq;
-
-			doc_score += term_score;
-
-			if (!have_ctid)
-			{
-				Assert(reader->cached_ctid_pages != NULL);
-				Assert(pivot_doc_id < reader->cached_num_docs);
-				ItemPointerSet(
-						ctid_out,
-						reader->cached_ctid_pages[pivot_doc_id],
-						reader->cached_ctid_offsets[pivot_doc_id]);
-				have_ctid = true;
-			}
-
-			if (!advance_term_iterator(ts))
-				(*active_count)--;
+			Assert(reader->cached_ctid_pages != NULL);
+			Assert(pivot_doc_id < reader->cached_num_docs);
+			ItemPointerSet(
+					ctid_out,
+					reader->cached_ctid_pages[pivot_doc_id],
+					reader->cached_ctid_offsets[pivot_doc_id]);
+			have_ctid = true;
 		}
+
+		if (!advance_term_iterator(ts))
+			(*active_count)--;
 	}
 
 	if (!have_ctid)
@@ -805,31 +920,84 @@ score_pivot_document(
 }
 
 /*
+ * Find the minimum doc ID among terms NOT at the pivot.
+ * Returns UINT32_MAX if all active terms are at the pivot.
+ */
+static uint32
+find_next_candidate_doc_id(TpTermState *terms, int term_count, uint32 pivot)
+{
+	uint32 min_doc_id = UINT32_MAX;
+	int	   term_idx;
+
+	for (term_idx = 0; term_idx < term_count; term_idx++)
+	{
+		uint32 doc_id = term_current_doc_id(&terms[term_idx]);
+		if (doc_id > pivot && doc_id < min_doc_id)
+			min_doc_id = doc_id;
+	}
+
+	return min_doc_id;
+}
+
+/*
  * Advance all iterators at the pivot past the current document.
- * Used when block-max pruning determines the pivot can't beat threshold.
+ *
+ * Uses WAND-style seeking: instead of advancing by 1, seek to the next
+ * candidate doc ID (minimum among terms not at pivot). This is O(log blocks)
+ * instead of O(blocks).
  */
 static void
 skip_pivot_document(
 		TpTermState *terms,
 		int			 term_count,
 		uint32		 pivot_doc_id,
-		int			*active_count)
+		int			*active_count,
+		TpBMWStats	*stats)
 {
-	int term_idx;
+	uint32 next_candidate;
+	int	   term_idx;
 
+	/* Find next promising doc ID and seek to it */
+	next_candidate =
+			find_next_candidate_doc_id(terms, term_count, pivot_doc_id);
+	if (next_candidate == UINT32_MAX)
+		next_candidate = pivot_doc_id + 1;
+
+	/* Advance all terms at pivot to the next candidate */
 	for (term_idx = 0; term_idx < term_count; term_idx++)
 	{
-		TpTermState *ts = &terms[term_idx];
-		uint32		 doc_id;
+		TpTermState *ts		= &terms[term_idx];
+		uint32		 doc_id = term_current_doc_id(ts);
+		uint32		 skip_distance;
 
-		if (!ts->found || ts->iter.finished)
+		if (doc_id != pivot_doc_id)
 			continue;
 
-		doc_id = tp_segment_posting_iterator_current_doc_id(&ts->iter);
-		if (doc_id == pivot_doc_id)
+		skip_distance = next_candidate - pivot_doc_id;
+
+		if (skip_distance > 1)
 		{
+			/* Use binary search seek */
+			if (!seek_term_to_doc(ts, next_candidate))
+				(*active_count)--;
+
+			if (stats)
+			{
+				uint32 landed_doc = term_current_doc_id(ts);
+				stats->seeks_performed++;
+				stats->docs_seeked += (next_candidate - pivot_doc_id - 1);
+				if (landed_doc <= pivot_doc_id + 1)
+					stats->seek_to_same_doc++;
+			}
+		}
+		else
+		{
+			/* Linear advance (skip_distance == 1) */
 			if (!advance_term_iterator(ts))
 				(*active_count)--;
+
+			if (stats)
+				stats->linear_advances++;
 		}
 	}
 }
@@ -876,7 +1044,7 @@ score_segment_multi_term_bmw(
 		if (max_possible < threshold)
 		{
 			skip_pivot_document(
-					terms, term_count, pivot_doc_id, &active_count);
+					terms, term_count, pivot_doc_id, &active_count, stats);
 			if (stats)
 				stats->blocks_skipped++;
 			continue;

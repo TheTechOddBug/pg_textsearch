@@ -470,14 +470,16 @@ Further language support is available via extensions such as [zhparser](https://
 ### Development Functions
 
 These functions are for debugging and development use only. Their interface may
-change in future releases without notice.
+change in future releases without notice. Functions marked with † require
+superuser privileges.
 
 Function | Description
 --- | ---
-bm25_dump_index(index_name) → text | Dump internal index structure (truncated)
-bm25_dump_index(index_name, file_path) → text | Dump full index structure to file
-bm25_summarize_index(index_name) → text | Show index statistics without content
+bm25_dump_index(index_name) † → text | Dump internal index structure (truncated)
+bm25_dump_index(index_name, file_path) † → text | Dump full index structure to file
+bm25_summarize_index(index_name) † → text | Show index statistics without content
 bm25_spill_index(index_name) → int4 | Force memtable spill to disk segment
+bm25_debug_pageviz(index_name, file_path) † → text | Generate page layout visualization
 
 ```sql
 -- Quick overview of index statistics
@@ -491,7 +493,18 @@ SELECT bm25_dump_index('docs_idx', '/tmp/docs_idx_dump.txt');
 
 -- Force spill to disk (returns number of entries spilled)
 SELECT bm25_spill_index('docs_idx');
+
+-- Generate page layout visualization (view with: less -R /tmp/pageviz.txt)
+SELECT bm25_debug_pageviz('docs_idx', '/tmp/pageviz.txt');
 ```
+
+#### Page Visualization
+
+The `bm25_debug_pageviz` function outputs an ANSI-colored map of index pages.
+Background colors indicate segments; letters indicate page types (`H`=header,
+`d`=dictionary, `s`=skip, `m`=docmap, `i`=index, blank=postings, `.`=empty).
+
+<img src="images/pageviz.jpg" width="600" alt="Page visualization example">
 
 ## Contributing
 

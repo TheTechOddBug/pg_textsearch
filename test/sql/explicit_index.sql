@@ -79,11 +79,25 @@ LIMIT 10;
 
 -- Positive test: without explicit index, implicit resolution works
 -- (uses first found index, with a warning about multiple indexes)
-SELECT id, content <@> 'ressources' AS score
+EXPLAIN (COSTS OFF)
+SELECT content <@> 'ressources' AS score
 FROM multi_index_test
 WHERE category_id = 1
 ORDER BY score
 LIMIT 3;
+
+-- All matching rows contain the same text, so the score is deterministic
+-- even though the tied tuple ids are not. Re-run the exact statement with
+-- warnings silenced and assert the repeated BM25 score values.
+SET client_min_messages = error;
+\pset format unaligned
+SELECT content <@> 'ressources' AS score
+FROM multi_index_test
+WHERE category_id = 1
+ORDER BY score
+LIMIT 3;
+\pset format aligned
+RESET client_min_messages;
 
 -- Positive test: explicit index matching the scanned index works
 -- Drop the simple index so french is the only choice

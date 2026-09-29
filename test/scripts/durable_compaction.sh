@@ -46,13 +46,23 @@ cleanup() {
     local exit_code=$?
 
     trap - EXIT INT TERM
+    if [ "${exit_code}" -ne 0 ] && [ -d "${DATA_DIR}" ]; then
+        rm -rf "${KEEP_DIR}"
+        mkdir -p "${KEEP_DIR}"
+        if ! PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' \
+            sql_super -x -c "SELECT * FROM df.instances;
+                SELECT * FROM df.nodes;
+                SELECT pid, state, wait_event_type, wait_event, query
+                FROM pg_stat_activity WHERE datname = current_database();" \
+            >"${KEEP_DIR}/workflow-state.log" 2>&1; then
+            log "Could not capture all workflow failure diagnostics"
+        fi
+    fi
     if [ -f "${DATA_DIR}/postmaster.pid" ]; then
         "${PGBINDIR}/pg_ctl" stop -D "${DATA_DIR}" -m immediate \
             >/dev/null 2>&1 || true
     fi
     if [ "${exit_code}" -ne 0 ] && [ -d "${DATA_DIR}" ]; then
-        rm -rf "${KEEP_DIR}"
-        mkdir -p "${KEEP_DIR}"
         cp "${LOGFILE}" "${KEEP_DIR}/" 2>/dev/null || true
     fi
     rm -rf "${DATA_DIR}"
@@ -588,16 +598,43 @@ quiesce_durable_worker() {
         "$(sql_super -c "SHOW shared_preload_libraries;")"
 }
 
+signal_node_is_waiting() {
+    local instance_id=$1 signal_name=${2:-}
+
+    # A running node is published before its signal subscription is durable.
+    sql_super -c "SELECT EXISTS (
+        SELECT 1 FROM df.instance_nodes('${instance_id}') n
+        JOIN _duroxide.history h
+          ON n.status_details::jsonb->>'execution_id' =
+             h.instance_id || '::' || h.execution_id
+        WHERE n.node_type = 'SIGNAL'
+          AND n.inferred_status = 'running'
+          AND ('${signal_name}' = '' OR
+               n.query::jsonb->>'signal_name' = '${signal_name}')
+          AND h.event_data::jsonb->>'type' = 'ExternalSubscribed'
+          AND h.event_data::jsonb->>'name' =
+              n.query::jsonb->>'signal_name'
+          AND NOT EXISTS (
+              SELECT 1 FROM _duroxide.history later
+              WHERE later.instance_id = h.instance_id
+                AND later.execution_id = h.execution_id
+                AND later.event_id > h.event_id
+                AND ((later.event_data::jsonb->>'type' = 'ExternalEvent'
+                      AND later.event_data::jsonb->>'name' =
+                          n.query::jsonb->>'signal_name')
+                     OR (later.event_data::jsonb->>'type' =
+                         'ExternalSubscribedCancelled'
+                         AND later.event_data::jsonb->>'source_event_id' =
+                             h.event_id::text))));"
+}
+
 wait_for_signal_node() {
-    local instance_id=$1 timeout=$2
+    local instance_id=$1 timeout=$2 signal_name=${3:-}
     local waited=0
 
     while [ "${waited}" -lt "${timeout}" ]; do
-        if [ "$(sql_super -c "SELECT EXISTS (
-                SELECT 1 FROM df.nodes
-                WHERE instance_id = '${instance_id}'
-                  AND node_type = 'SIGNAL'
-                  AND status = 'running');")" = "t" ]; then
+        if [ "$(signal_node_is_waiting \
+            "${instance_id}" "${signal_name}")" = "t" ]; then
             return 0
         fi
         sleep 1
@@ -11749,10 +11786,54 @@ run_test() {
     fi
 }
 
+test_signal_wait_readiness() {
+    local instance_id waiting
+
+    instance_id="$(sql_as durable_owner -c "
+        SELECT df.start(
+            df.seq(
+                df.race(df.wait_for_signal('compact'),
+                        df.wait_for_signal('advance')),
+                df.sleep(3600)),
+            'signal-readiness', current_database(), 'caller');")"
+    for _ in $(seq 1 30); do
+        waiting="$(sql_super -c "SELECT count(*)
+            FROM df.instance_nodes('${instance_id}')
+            WHERE node_type = 'SIGNAL'
+              AND inferred_status = 'running';")"
+        [ "${waiting}" = "2" ] && break
+        sleep 1
+    done
+    assert_eq "signal-readiness fixture reaches both waits" "2" "${waiting}"
+    wait_for_signal_node "${instance_id}" 30
+    assert_eq "active signal wait is ready" "t" \
+        "$(signal_node_is_waiting "${instance_id}")"
+    wait_for_signal_node "${instance_id}" 30 advance
+    sql_as durable_owner -c \
+        "SELECT df.signal('${instance_id}', 'advance', '{}');" >/dev/null
+    for _ in $(seq 1 30); do
+        waiting="$(sql_super -c "SELECT count(*)
+            FROM df.instance_nodes('${instance_id}')
+            WHERE node_type = 'SIGNAL'
+              AND inferred_status = 'skipped';")"
+        [ "${waiting}" = "1" ] && break
+        sleep 1
+    done
+    assert_eq "signal-readiness fixture retires the losing wait" "1" \
+        "${waiting}"
+    assert_eq "retired signal wait is not ready" "f" \
+        "$(signal_node_is_waiting "${instance_id}")"
+    sql_as durable_owner -c \
+        "SELECT df.cancel('${instance_id}', 'readiness test complete');" \
+        >/dev/null
+    wait_for_terminal "${instance_id}" 30
+}
+
 stage_durable_package
 setup_cluster
 run_test test_missing_durable_cic
 initialize_database
+run_test test_signal_wait_readiness
 run_test test_cic_preflight_rejections
 run_test test_cic_owner_privilege_preflight
 run_test test_alter_preflight_rejections

@@ -57,6 +57,7 @@ OBJS = \
 	src/segment/fieldnorm.obj \
 	src/scoring/bmw.obj \
 	src/scoring/bm25.obj \
+	src/scoring/snapshot.obj \
 	src/types/array.obj \
 	src/types/vector.obj \
 	src/types/query.obj \

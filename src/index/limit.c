@@ -16,7 +16,7 @@ tp_seed_limit_for_filter(int user_limit, double selectivity)
 	if (!tp_filtered_seed || selectivity <= 0.0 || selectivity >= 1.0)
 		return user_limit;
 	seeded = ceil(tp_filtered_seed_margin * (double)user_limit / selectivity);
-	if (seeded > (double)TP_MAX_QUERY_LIMIT)
-		seeded = TP_MAX_QUERY_LIMIT;
+	if (seeded > (double)TP_MAX_INITIAL_QUERY_LIMIT)
+		seeded = TP_MAX_INITIAL_QUERY_LIMIT;
 	return seeded > user_limit ? (int)seeded : user_limit;
 }

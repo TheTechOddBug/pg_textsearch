@@ -71,6 +71,7 @@ typedef struct TpMemtableCacheSource
 	 * before pfree.
 	 */
 	bool holding_cache_lock;
+	bool holding_apply_lock;
 } TpMemtableCacheSource;
 
 /* ---------- TpDataSourceOps implementations ---------- */
@@ -214,6 +215,12 @@ cache_close(TpDataSource *source)
 		cs->holding_cache_lock = false;
 	}
 
+	if (cs->holding_apply_lock)
+	{
+		LWLockRelease(&cs->memtable->apply_lock);
+		cs->holding_apply_lock = false;
+	}
+
 	if (cs->lock_state != NULL)
 	{
 		tp_release_index_lock(cs->lock_state);
@@ -354,16 +361,18 @@ catchup_cache(TpLocalIndexState *state, Relation rel)
 
 /* ---------- public constructors ---------- */
 
-TpDataSource *
-tp_memtable_cache_source_create(
-		TpLocalIndexState *state,
-		Relation		   rel,
-		const char *const *query_terms,
-		int				   query_term_count)
+static TpDataSource *
+tp_memtable_cache_source_create_internal(
+		TpLocalIndexState			  *state,
+		Relation					   rel,
+		const char *const			  *query_terms,
+		int							   query_term_count,
+		const TpMemtableChainSnapshot *snapshot)
 {
 	TpMemtableCacheSource *cs;
 	TpMemtable			  *memtable;
 	TpLocalIndexState	  *lock_state_to_release;
+	bool				   matched_snapshot = false;
 
 	(void)query_terms;
 	(void)query_term_count;
@@ -396,12 +405,48 @@ tp_memtable_cache_source_create(
 		return NULL;
 	}
 
+	if (snapshot != NULL)
+	{
+		bool empty_snapshot = !BlockNumberIsValid(snapshot->head_blkno);
+		bool locator_matches;
+		bool locator_mismatch;
+
+		LWLockAcquire(&memtable->apply_lock, LW_SHARED);
+		LWLockAcquire(&memtable->lock, LW_SHARED);
+		locator_matches = memtable->cursor_locator_valid &&
+						  RelFileLocatorEquals(
+								  memtable->cursor_locator, rel->rd_locator);
+		locator_mismatch = memtable->cursor_locator_valid && !locator_matches;
+		matched_snapshot =
+				!empty_snapshot && locator_matches &&
+				memtable->cursor_next_blkno == snapshot->tail_blkno &&
+				memtable->cursor_next_off == snapshot->tail_free_offset &&
+				memtable->cursor_gen_spill_count ==
+						pg_atomic_read_u64(&state->shared->spill_generation) &&
+				memtable->string_hash_handle != DSHASH_HANDLE_INVALID &&
+				memtable->doc_lengths_handle != DSHASH_HANDLE_INVALID;
+		if (!matched_snapshot)
+		{
+			LWLockRelease(&memtable->lock);
+			LWLockRelease(&memtable->apply_lock);
+		}
+		if (locator_mismatch || empty_snapshot)
+		{
+			/* Drain discarded-file cache bytes even for an empty chain. */
+			if (locator_mismatch)
+				(void)tp_cache_apply_to_tail(state, rel);
+			if (lock_state_to_release != NULL)
+				tp_release_index_lock(lock_state_to_release);
+			return NULL;
+		}
+	}
+
 	/*
 	 * Run the apply protocol with per-index SHARED held.  On a
 	 * non-OK terminal outcome the cache cannot serve this query;
 	 * fall back to chain_source (signalled by NULL return).
 	 */
-	if (!catchup_cache(state, rel))
+	if (!matched_snapshot && !catchup_cache(state, rel))
 	{
 		if (lock_state_to_release != NULL)
 			tp_release_index_lock(lock_state_to_release);
@@ -413,14 +458,23 @@ tp_memtable_cache_source_create(
 	cs->state			   = state;
 	cs->memtable		   = memtable;
 	cs->lock_state		   = lock_state_to_release;
-	cs->holding_cache_lock = false;
+	cs->holding_cache_lock = matched_snapshot;
+	cs->holding_apply_lock = matched_snapshot;
 	cs->string_table	   = NULL;
 	cs->doclength_table	   = NULL;
 
 	PG_TRY();
 	{
-		LWLockAcquire(&memtable->lock, LW_SHARED);
-		cs->holding_cache_lock = true;
+		if (snapshot != NULL && !cs->holding_apply_lock)
+		{
+			LWLockAcquire(&memtable->apply_lock, LW_SHARED);
+			cs->holding_apply_lock = true;
+		}
+		if (!cs->holding_cache_lock)
+		{
+			LWLockAcquire(&memtable->lock, LW_SHARED);
+			cs->holding_cache_lock = true;
+		}
 
 		/*
 		 * Re-check handle validity under cache.lock SHARED.
@@ -457,12 +511,26 @@ tp_memtable_cache_source_create(
 			dshash_detach(cs->doclength_table);
 		if (cs->holding_cache_lock)
 			LWLockRelease(&memtable->lock);
+		if (cs->holding_apply_lock)
+			LWLockRelease(&memtable->apply_lock);
 		if (lock_state_to_release != NULL)
 			tp_release_index_lock(lock_state_to_release);
 		pfree(cs);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	/*
+	 * Deferred reclaim prevents endpoint reuse while the executor's heap
+	 * snapshot lives. Freeze cache catch-up until this source is closed.
+	 */
+	if (snapshot != NULL &&
+		(memtable->cursor_next_blkno != snapshot->tail_blkno ||
+		 memtable->cursor_next_off != snapshot->tail_free_offset))
+	{
+		cache_close((TpDataSource *)cs);
+		return NULL;
+	}
 
 	if (tp_log_cache_state)
 		elog(LOG,
@@ -473,6 +541,46 @@ tp_memtable_cache_source_create(
 			 cs->base.total_len);
 
 	return (TpDataSource *)cs;
+}
+
+TpDataSource *
+tp_memtable_cache_source_create(
+		TpLocalIndexState *state,
+		Relation		   rel,
+		const char *const *query_terms,
+		int				   query_term_count)
+{
+	return tp_memtable_cache_source_create_internal(
+			state, rel, query_terms, query_term_count, NULL);
+}
+
+TpDataSource *
+tp_memtable_source_create_for_snapshot(
+		TpLocalIndexState			  *state,
+		Relation					   rel,
+		const TpMemtableChainSnapshot *snapshot,
+		bool						   recovery,
+		const char *const			  *query_terms,
+		int							   query_term_count)
+{
+	TpDataSource *source;
+
+	if (!recovery && tp_memtable_cache_enabled)
+	{
+		source = tp_memtable_cache_source_create_internal(
+				state, rel, query_terms, query_term_count, snapshot);
+		if (source != NULL)
+			return source;
+	}
+	if (!BlockNumberIsValid(snapshot->head_blkno))
+		return NULL;
+	if (tp_log_cache_state)
+		elog(LOG,
+			 "pg_textsearch cache_source: snapshot uses bounded chain "
+			 "(oid=%u)",
+			 RelationGetRelid(rel));
+	return tp_memtable_chain_source_create_bounded(
+			rel, snapshot, query_terms, query_term_count);
 }
 
 TpDataSource *
